@@ -1,334 +1,200 @@
 # NE India Landslide Early-Warning System — Implementation Plan
 
-This plan sequences the build into phases for an AI coding agent (e.g. Claude Code).
-Every phase's prompt tells the agent to **read `DESIGN.md` first** and defer to it for
-any architectural/design decision not explicitly pinned down here. This file pins down
-*what* to build and *in what order*; `DESIGN.md` should remain the source of truth for
-*how* (stack choices, naming conventions, folder layout, auth scheme, etc.).
+This plan sequences the build into phases for an AI coding agent. Every phase's prompt tells the agent to **read `DESIGN.md` and `ARCHITECTURE.md` first** and defer to them for any architectural/design decision not explicitly pinned down here.
 
-Treat each phase as a separate agent session/task. Do not start Phase N+1 until Phase N's
-acceptance criteria are met — later phases assume earlier ones exist and work.
+Treat each phase as a separate agent session/task. Do not start Phase N+1 until Phase N's acceptance criteria are met — later phases assume earlier ones exist and work.
+
+**Docker Rule**: Every phase must execute, test, and validate inside Docker containers (`docker compose up`). Do not rely on host-level Python or Node.js runtimes.
 
 ---
 
-## Phase 0 — Repo & Environment Scaffolding
+## Phase 0 — Dockerized Repo & Environment Scaffolding
 
-**Goal:** A running skeleton with no business logic yet — proves the stack boots.
+**Goal:** A fully dockerized running skeleton with live-reloading backend and health checks — proves the container stack boots.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` fully before doing anything. Set up the project skeleton it describes:
-> FastAPI backend, Postgres (with PostGIS enabled), and whatever frontend framework
-> `DESIGN.md` specifies. Create the folder structure `DESIGN.md` lays out (or propose one
-> and confirm with me if it doesn't specify one). Add a working `docker-compose.yml` (or
-> equivalent, per `DESIGN.md`) that brings up Postgres+PostGIS and the FastAPI app with a
-> single `/health` endpoint. Add `.env.example` for all config the app will need (DB URL,
-> external API keys/endpoints, model file paths). Do not implement any model, DB table, or
-> business route yet — this phase is scaffolding only. Confirm `/health` returns 200 before
-> finishing.
+> Read `DESIGN.md` and `ARCHITECTURE.md` fully before doing anything. Set up the containerized project skeleton:
+> FastAPI backend, Postgres with PostGIS enabled, and a lightweight Node/Frontend scaffolding matching `DESIGN.md`. 
+> Create the directory layout matching `ARCHITECTURE.md`.
+> Create a comprehensive `docker-compose.yml` that brings up:
+> 1. `db`: Postgres + PostGIS with persistent volume mounts and health check (`pg_isready`).
+> 2. `api`: FastAPI application with hot-reloading (`uvicorn --reload`), mounting `./backend` code into the container.
+> 3. `redis`: Redis instance for background tasks/caching (if specified in `ARCHITECTURE.md`/`DESIGN.md`).
+> Add `.env.example` for all config the app will need (DB URL, external API keys, model file paths).
+> Ensure a single `/health` endpoint exists on FastAPI that verifies DB connectivity.
+> Confirm `docker compose up` brings up all services cleanly and `/health` returns HTTP 200 before finishing.
 
 **Acceptance criteria:**
-- `docker-compose up` (or equivalent) brings up DB + API cleanly
-- `/health` returns 200
-- `.env.example` covers every secret/config referenced anywhere later in this plan
+- `docker compose up` brings up DB, API, and Redis cleanly without host dependencies.
+- `curl http://localhost:8000/health` inside or outside the container returns 200 with DB health verified.
+- `.env.example` covers all environment variables required by all services.
 
 ---
 
-## Phase 1 — Database Schema (Postgres + PostGIS)
+## Phase 1 — Database Schema & Dockerized Migrations
 
-**Goal:** Tables exist, migrated, matching what later phases need to read/write.
+**Goal:** PostGIS spatial tables exist, migrated via Alembic inside Docker.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for naming conventions, migration tool choice (Alembic unless
-> `DESIGN.md` says otherwise), and any schema decisions it already made. Implement these
-> tables, adjusting types/names to match `DESIGN.md`'s conventions:
-> - `risk_grid`: id, location (PostGIS `geography(Point)`), latitude, longitude,
->   elevation_m, slope_deg, aspect_sin, aspect_cos, curvature, relief_amplitude,
->   roughness, plan_curvature, profile_curvature, susceptibility, trigger_score,
->   combined_risk, event_date, computed_at.
-> - `rainfall_ndvi_cache`: cell_lat, cell_lon, event_date, rain_1d..rain_30d, ndvi,
->   ndvi_date, fetched_at. Unique on (cell_lat, cell_lon, event_date).
-> - `incidents`: id, user_id, latitude, longitude, description, media_refs (array/json),
->   status (pending/verified/rejected), created_at, verified_at.
-> - `alerts`: id, risk_grid_id (nullable), severity (low/moderate/high/critical), title,
->   reason (explainability text), affected_area (geography, nullable), created_at,
->   dispatched_at.
-> - `users`, `roles`: matching whatever auth/RBAC scheme `DESIGN.md` specifies.
-> Write this as versioned migrations, not a single init script, so schema changes later
-> in the project are trackable. Add indexes for: spatial lookups on `risk_grid.location`
-> (GiST index), and the unique constraint on `rainfall_ndvi_cache`. Do not write any
-> application code that uses these tables yet.
+> Read `DESIGN.md` and `ARCHITECTURE.md` for schema specifications and naming conventions.
+> Configure Alembic migrations inside the `api` container. Implement the following tables:
+> - `risk_grid`: id, location (PostGIS `geography(Point)`), latitude, longitude, elevation_m, slope_deg, aspect_sin, aspect_cos, curvature, relief_amplitude, roughness, plan_curvature, profile_curvature, susceptibility, trigger_score, combined_risk, event_date, computed_at.
+> - `rainfall_ndvi_cache`: cell_lat, cell_lon, event_date, rain_1d..rain_30d, ndvi, ndvi_date, fetched_at. Unique on (cell_lat, cell_lon, event_date).
+> - `incidents`: id, user_id, latitude, longitude, description, media_refs (array/json), status (pending/verified/rejected), created_at, verified_at.
+> - `alerts`: id, risk_grid_id (nullable), severity (low/moderate/high/critical), title, reason (explainability text), affected_area (geography, nullable), created_at, dispatched_at.
+> - `users`, `roles`: matching hardcoded seed user structures per `ARCHITECTURE.md` §6.
+> Write versioned migrations. Add spatial GiST indexes on `risk_grid.location` and unique constraints on `rainfall_ndvi_cache`.
+> Add an entrypoint script or container command to auto-run migrations (`alembic upgrade head`) and seed hardcoded profiles (`db/seed_profiles.py`) upon DB container readiness.
 
 **Acceptance criteria:**
-- Migrations run cleanly from empty DB
-- PostGIS spatial index exists on `risk_grid.location`
-- Schema reviewed against DESIGN.md's naming conventions before merging
+- `docker compose run --rm api alembic upgrade head` executes without errors on a fresh PostGIS container.
+- Spatial indexes exist on `risk_grid.location`.
+- Hardcoded profiles are seeded in the database upon startup.
 
 ---
 
-## Phase 2 — Model Artifact Loading Layer
+## Phase 2 — Docker-Compatible Model Artifact Loading Layer
 
-**Goal:** The two trained models (`model_v3` susceptibility, `model_trigger`) load once
-at app startup and are available to request handlers without re-loading per request.
+**Goal:** The two trained models (`model_v3` susceptibility, `model_trigger`) load safely within the container environment during startup.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for where trained model artifacts should live (local path vs. object
-> storage) and how app-wide singletons should be managed in this FastAPI app. The two
-> model files are `model_v3_susceptibility.joblib` and `model_trigger.joblib`, each with
-> a companion `*_feature_cols.json` pinning exact input column order — treat the JSON as
-> the single source of truth for feature order, never hardcode column order elsewhere.
-> Implement a `ModelRegistry` (or whatever pattern `DESIGN.md` prefers) that:
-> - Loads both models + their feature-column lists once in the FastAPI `lifespan` startup
->   hook, not per-request.
-> - Exposes a typed method to predict susceptibility given a dict of the 9 (or 7, pruned)
->   terrain features, and trigger probability given a dict of the 7 trigger features —
->   internally reindexing the dict to the JSON's column order before calling
->   `predict_proba`, so a caller passing keys in any order can't silently corrupt results.
-> - Fails loudly at startup (not at first request) if either artifact or its JSON is
->   missing or the columns don't match what the loaded model expects.
-> Do not implement any feature-extraction (DEM, rainfall, NDVI) or any API route in this
-> phase — only the load-and-predict layer, testable in isolation with a hand-built
-> feature dict.
+> Read `ARCHITECTURE.md` §2 and §4.4. Ensure model artifacts (`model_v3_susceptibility.joblib`, `model_trigger.joblib`) and their companion `*_feature_cols.json` files are properly mounted via volume or path configuration in `docker-compose.yml` into `app/ml/artifacts/`.
+> Implement `ml/loader.py` and `services/model_registry.py` that:
+> - Loads both models + feature column order dynamically in the FastAPI `lifespan` hook during container boot.
+> - Validates column order matching the feature JSON and exposes typed prediction methods.
+> - Fails startup immediately if model artifacts are corrupted or missing from the mounted container directory.
+> Add Dockerized unit tests (`docker compose run --rm api pytest tests/unit/test_model_registry.py`) testing feature reordering and failure states.
 
 **Acceptance criteria:**
-- Unit test: loading with a deliberately-reordered feature dict still produces the same
-  prediction as the correctly-ordered dict
-- Unit test: missing/mismatched artifact fails at startup, not silently at inference time
+- API container boots successfully with mounted model artifacts.
+- Unit tests run and pass inside a Docker container via `pytest`.
 
 ---
 
-## Phase 3 — Feature Extraction Services
+## Phase 3 — Feature Extraction Services & Caching
 
-**Goal:** Port the notebook's DEM/rainfall/NDVI extraction logic into backend services,
-with the external-API calls going through the `rainfall_ndvi_cache` table from Phase 1.
+**Goal:** DEM/rainfall/NDVI extraction services operating with containerized caching (`rainfall_ndvi_cache`).
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for service-layer conventions (where business logic lives relative to
-> routes, whether it uses a repository pattern, async vs sync DB access, etc.). Port the
-> following into backend services, matching those conventions:
-> - `TerrainFeatureService`: given lat/lon, reads the Copernicus DEM COG tile (same
->   `/vsicurl/` tile-URL pattern as the prototype notebook) and computes elevation, slope,
->   aspect (as sin/cos), curvature, relief amplitude, roughness, plan/profile curvature.
-> - `RainfallNdviService`: given lat/lon/event_date, first checks `rainfall_ndvi_cache`
->   (snapped to the same ~0.5° cell size used in the prototype, since that's NASA POWER's
->   native resolution) before calling NASA POWER (antecedent rainfall, windows 1/3/7/15/30
->   days) and the MODIS ORNL NDVI endpoint. On a cache miss, fetch, upsert into the cache
->   table, then return. On external API failure, retry with backoff (reuse the prototype's
->   retry pattern) and return a clearly-flagged null/NaN result rather than raising, so a
->   single bad point doesn't crash a batch job.
-> Ask me for the exact prototype extraction code if you need the geomorphometric formulas
-> (relief amplitude, roughness, plan/profile curvature) — don't reimplement them from
-> scratch or guess at the Zevenbergen & Thorne finite-difference coefficients.
-> Write these as pure services with no FastAPI route wiring yet — they should be directly
-> unit-testable against a few known lat/lon points.
+> Read `ARCHITECTURE.md` §2 for service layout. Implement:
+> - `TerrainFeatureService`: Reads DEM tiles via `/vsicurl/` over network and computes 9 geomorphometric features.
+> - `RainfallNdviService`: Fetches NASA POWER / MODIS rainfall & NDVI data, using `rainfall_ndvi_cache` table to prevent duplicate fetches.
+> Ensure all external requests handle network retries, timeouts, and fallback graceful failures gracefully.
+> Write isolated Dockerized unit/integration tests (`docker compose run --rm api pytest tests/unit/test_services.py`) using mocked HTTP calls for external APIs.
 
 **Acceptance criteria:**
-- Both services testable in isolation (mock the external HTTP calls in tests)
-- Cache-hit path never makes an external HTTP call — verify this in a test
-- A deliberately invalid coordinate returns a flagged-null result, not an exception
+- Tests execute inside the `api` Docker container and pass.
+- Cache hits avoid external HTTP calls.
+- Failed external API requests return flagged-null results rather than crashing the process.
 
 ---
 
-## Phase 4 — Synchronous Risk API (fast path)
+## Phase 4 — Synchronous Fast-Path Risk API
 
-**Goal:** `GET /api/risk` and `GET /api/risk/grid` — reads from `risk_grid`, no live
-model inference, matches the diagram's "Current Location State Engine."
+**Goal:** `GET /api/risk` and `GET /api/risk/grid` reading directly from PostGIS inside Docker without running inference.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for API route/response conventions (versioning, error format,
-> pagination style). Implement:
-> - `GET /api/risk?lat=&lon=` — nearest-neighbor PostGIS query against `risk_grid`
->   (`ST_Distance` / `<->` operator), returns susceptibility, trigger_score,
->   combined_risk, computed_at, and a severity band (low/moderate/high/critical —
->   confirm thresholds with me or check if `DESIGN.md` already defines them). Return a
->   clear "no cached data near this point yet" response rather than a 500 if the grid
->   doesn't cover that area.
-> - `GET /api/risk/grid?bbox=` — returns all `risk_grid` rows within a bounding box as
->   GeoJSON FeatureCollection, for map rendering on the frontend.
-> Both routes must not call the model registry or feature-extraction services directly —
-> they only read `risk_grid`, which Phase 6's background job populates. Add integration
-> tests against a seeded test DB with a handful of known `risk_grid` rows.
+> Implement Fast-Path routes per `ARCHITECTURE.md` §4.1:
+> - `GET /api/risk?lat=&lon=`: Fast PostGIS nearest-neighbor spatial query.
+> - `GET /api/risk/grid?bbox=`: Spatial bounding-box query returning GeoJSON FeatureCollection.
+> Ensure responses conform strictly to `DESIGN.md` risk severity definitions.
+> Write Dockerized integration tests in `tests/integration/test_risk_routes.py` verifying response times (<200ms) and spatial output formatting.
 
 **Acceptance criteria:**
-- Both routes respond in well under 200ms against a seeded local DB (no external calls,
-  no model inference — this is the whole point of the split)
-- Empty-grid-region case returns a clean, documented response, not an error
+- Endpoint tests pass inside Docker against a seeded test database.
+- Zero calls to external APIs or model registry from these routes.
 
 ---
 
-## Phase 5 — On-Demand Assessment API (slow path)
+## Phase 5 — On-Demand Live Assessment API (Slow Path)
 
-**Goal:** `POST /api/risk/assess` — the one endpoint allowed to run live inference,
-for a single arbitrary point not yet in the grid (matches diagram's on-demand
-"Landslide Risk Engine" trigger).
+**Goal:** `POST /api/risk/assess` endpoint performing live inference and persisting results into `risk_grid`.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for background-task/async conventions. Implement
-> `POST /api/risk/assess { lat, lon, event_date? }` that:
-> - Calls `TerrainFeatureService` and `RainfallNdviService` from Phase 3 live
-> - Feeds results through `ModelRegistry` from Phase 2 to get susceptibility, trigger,
->   and combined_risk (susceptibility × trigger)
-> - Returns the result immediately in the response (this endpoint is explicitly allowed
->   to be slower than Phase 4's routes, since it's a deliberate one-off action), and also
->   upserts the result into `risk_grid` so future nearby `GET /api/risk` calls benefit
-> - Rate-limit or otherwise guard this route per `DESIGN.md`'s policy, since it's the one
->   path that can generate real external-API load per request — ask me if `DESIGN.md`
->   doesn't specify a policy.
-> Document in the route's docstring/OpenAPI description that this is the *only*
-> synchronous route permitted to call external APIs, so future contributors don't add
-> more without thinking about latency.
+> Implement the single synchronous live inference endpoint `POST /api/risk/assess` per `ARCHITECTURE.md` §4.3:
+> - Calls `TerrainFeatureService` and `RainfallNdviService` live.
+> - Evaluates risk via `ModelRegistry`.
+> - Upserts results into `risk_grid` and returns the immediate risk assessment.
+> Limit rate per IP/User to prevent API abuse.
+> Write Docker integration tests ensuring live inference completes and persistency in PostGIS is verified.
 
 **Acceptance criteria:**
-- Response includes both the live result and confirmation it was persisted to `risk_grid`
-- A second `GET /api/risk` call for a nearby point after this now returns the new data
+- `POST /api/risk/assess` runs live inference inside the container and saves to PostGIS.
+- Subsequent `GET /api/risk` queries pick up the updated score immediately.
 
 ---
 
-## Phase 6 — Background Grid Refresh Job
+## Phase 6 — Containerized Background Scheduler & Grid Refresh Job
 
-**Goal:** Scheduled job that keeps `risk_grid` current, matching the diagram's ingestion
-→ processing engines running continuously behind the scenes.
+**Goal:** Periodic scoring pipeline running in a dedicated Celery/APScheduler container.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for the chosen task scheduler (Celery+Redis, APScheduler, or other —
-> don't assume, check first) and its configured schedule/retry conventions. Implement a
-> job that:
-> - On first run (or when new grid points are added), computes static terrain features
->   for every point in the scoring grid via `TerrainFeatureService` and stores them —
->   these never need recomputation unless the DEM source changes, so separate this from
->   the rainfall/NDVI refresh, which does need to rerun regularly.
-> - On its recurring schedule (confirm interval with me — antecedent rainfall windows go
->   up to 30 days, so refreshing more often than every few hours has limited value; every
->   6 hours is a reasonable default, but check `DESIGN.md` or ask), re-fetches
->   rainfall/NDVI for the grid's unique 0.5° cells via `RainfallNdviService`, re-scores
->   every grid point through `ModelRegistry`, and upserts into `risk_grid`.
-> - After each refresh, diffs new `combined_risk` values against the previous run's
->   values per point; where a point crosses a severity threshold upward, writes a row to
->   `alerts` with an explainability `reason` string (e.g. "rain_7d rose from Xmm to Ymm,
->   pushing trigger score from A to B" — keep it human-readable per the diagram's
->   "Explainable Risk Intelligence" box).
-> - Logs enough (points processed, cache hit rate, failures) to debug a bad run without
->   re-running it.
-> This job must be resumable/idempotent — if it dies partway through a grid refresh, a
-> retry should not double-charge external API calls for cells already fetched this run.
+> Read `ARCHITECTURE.md` §1 & §2. Add a `worker` service in `docker-compose.yml` running the background scheduler:
+> - One-off computation: Calculates static DEM features for grid points via `TerrainFeatureService`.
+> - Scheduled refresh (~6h): Re-fetches rainfall/NDVI, re-scores grid points via `ModelRegistry`, and upserts into `risk_grid`.
+> - Alerting: Diffs new `combined_risk` values against prior state; creates `alerts` rows with human-readable explainability strings (`reason`) on upward threshold crosses.
+> Ensure job execution is idempotent and container restarts resume gracefully without repeating cached external API requests.
 
 **Acceptance criteria:**
-- Job runs end-to-end against a small test grid (not the full ~34k-point production grid)
-  in CI or local test
-- Killing and restarting the job mid-run doesn't duplicate API calls for already-cached
-  cells in that run
-- At least one seeded "crosses threshold" scenario produces an `alerts` row with a
-  populated `reason`
+- `worker` container boots alongside `api` in `docker-compose.yml`.
+- Scheduled execution processes grid points and populates `alerts` with explainable reason strings upon risk escalations.
 
 ---
 
 ## Phase 7 — Incident Reporting & Feedback Loop
 
-**Goal:** Citizen-submitted reports (diagram's "Report Incident" + "Feedback &
-Verification Loop"), feeding back into the system rather than sitting inert.
+**Goal:** Incident submission and field verification routes.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for file/media upload conventions (storage backend for photos/videos)
-> and the auth/RBAC scheme for who can verify a report. Implement:
-> - `POST /api/incidents` — citizen submits lat/lon, description, media; stored with
->   status `pending`.
-> - `PATCH /api/incidents/{id}` — authorized field/admin user marks
->   verified/rejected, per `DESIGN.md`'s RBAC rules.
-> - On verification, optionally trigger a Phase 5-style on-demand reassessment of that
->   location (confirm with me whether every verified incident should trigger this, or
->   only ones that materially disagree with the current cached risk — the diagram's
->   "Reassess Risk" step in the Feedback & Verification Loop implies this should happen,
->   but the exact trigger condition needs a decision).
-> Do not build photo/video hazard analysis (the diagram's "Field Image Analysis Engine")
-> in this phase — that's a separate model/service, out of scope until we decide whether
-> to build it.
+> Implement incident reporting routes per `ARCHITECTURE.md` §2:
+> - `POST /api/incidents`: Submit incident with description, location, and media references.
+> - `PATCH /api/incidents/{id}`: Update incident verification status (restricted to admin/officer profiles per `ARCHITECTURE.md` §6).
+> - Trigger an automatic reassessment (`POST /api/risk/assess` logic) for verified incident locations.
+> Store media references appropriately (e.g. mock/local volume upload endpoint inside Docker).
 
 **Acceptance criteria:**
-- Full lifecycle (submit → pending → verify → status update) testable end-to-end
-- Verification triggers whatever reassessment behavior was agreed, and it's observable
-  in `risk_grid`/`alerts`
+- Complete incident lifecycle (submit → verify → trigger reassessment) passes in Docker integration tests.
 
 ---
 
-## Phase 8 — Auth & RBAC
+## Phase 8 — Profile-Based RBAC & Stand-in Auth
 
-**Goal:** Diagram's "Login/Sign-up → Authorization (RBAC) → Government/Citizen" split,
-enforced on every route added in prior phases.
+**Goal:** Enforce hardcoded user profile selection and role permissions across all routes.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for the exact auth scheme (JWT, session, provider) already decided.
-> Implement login/signup and role-based access control matching it, then retrofit every
-> route from Phases 4, 5, and 7 with the correct role requirements (e.g. citizens can
-> call `GET /api/risk` and `POST /api/incidents` but not `PATCH /api/incidents/{id}`;
-> government/admin roles can access dashboards and verification routes). Do not change
-> any route's business logic — only add auth dependencies. Add tests asserting each
-> route rejects insufficiently-privileged callers.
+> Read `ARCHITECTURE.md` §6. Implement `POST /api/profiles/select` and `deps.py:get_current_profile`:
+> - Resolve profile selection (Region + Role: Admin, Officer, Citizen) based on incoming headers or profile cookies.
+> - Enforce RBAC middleware/dependencies across all routes (e.g., Citizen can create incidents but cannot verify them or trigger admin workflows).
+> Add unit/integration tests confirming unauthorized requests return HTTP 403.
 
 **Acceptance criteria:**
-- Every route from Phases 4/5/7 has an explicit, tested role requirement — no route left
-  implicitly open by omission
+- Route permissions are strictly enforced based on selected hardcoded profiles inside Docker test suites.
 
 ---
 
-## Phase 9 — Alerts & Notification Dispatch
+## Phase 9 — Alert Dispatcher Service
 
-**Goal:** Turn `alerts` rows (written by Phase 6) into actual outbound notifications.
+**Goal:** Outbound alert dispatch system.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for which notification channels are in scope for this version (SMS,
-> push, dashboard-only, etc. — the diagram shows SMS/App Push/Dashboard/Community, but
-> confirm which are actually being built now vs. later). Implement a dispatcher that
-> picks up new `alerts` rows and sends them via the confirmed channel(s), marking
-> `dispatched_at` once sent. Keep the dispatcher decoupled from Phase 6's scoring job —
-> it should be triggerable independently (e.g. its own small scheduled poll, or a
-> Postgres LISTEN/NOTIFY trigger if `DESIGN.md` prefers event-driven over polling).
+> Build a dedicated background dispatcher task (in the `worker` container) that polls/subscribes to un-dispatched `alerts` rows and processes them, setting `dispatched_at` timestamp.
+> Ensure alert formatting aligns with `DESIGN.md` §18 & §19 notification rules.
 
 **Acceptance criteria:**
-- A manually-inserted `alerts` row gets dispatched and `dispatched_at` populated, without
-  needing to run the full Phase 6 job
+- `alerts` rows receive `dispatched_at` timestamps upon worker execution without blocking API request threads.
 
 ---
 
-## Phase 10 — Frontend Integration
+## Phase 10 — Containerized Frontend & UI Integration
 
-**Goal:** Wire the frontend (framework per `DESIGN.md`) to the endpoints above.
+**Goal:** Build and serve the frontend web app fully containerized.
 
 **Prompt for the agent:**
-> Read `DESIGN.md` for the frontend stack, state-management approach, and map/visualization
-> library already chosen. Build, in this order: (1) the map view consuming
-> `GET /api/risk/grid?bbox=` to render the heatmap, (2) the location-detail view
-> consuming `GET /api/risk`, (3) the incident-report form posting to
-> `POST /api/incidents`, (4) the admin dashboard's alert list. Do not build the "Ask AI"
-> assistant or the Field Image Analysis upload flow yet — those depend on services not
-> built in this plan. Match `DESIGN.md`'s component/folder conventions.
+> Read `DESIGN.md` for UI specifications and design system tokens. Add a `frontend` service to `docker-compose.yml` (e.g., Vite/React or Next.js dev server with hot reloading):
+> - Implement Map View (`GET /api/risk/grid`), Location Detail (`GET /api/risk`), Incident Report Form (`POST /api/incidents`), and Profile Selector (`/profiles`).
+> - Apply design tokens, Lucide icons, and semantic risk scales (`#159447`, `#D9A441`, `#E57A17`, `#C92A2A`) per `DESIGN.md` §4.3.
+> Ensure proxying/CORS works seamlessly between `frontend` and `api` containers.
 
 **Acceptance criteria:**
-- All four views work against the Phase 0-9 backend running locally
-- Map correctly reflects severity bands from Phase 4's thresholds
-
----
-
-## Explicitly Out of Scope for This Plan
-
-These appear in the architecture diagram but are **not** covered by phases above —
-call this out to the agent so it doesn't try to improvise them:
-- Satellite Change Engine (surface/slope change detection)
-- Field Image Analysis Engine (photo/video hazard detection)
-- "Ask AI" assistant
-- Multilingual alert content
-- Response Prioritization / Response & Action Engine (resource dispatch logic)
-
-If any of these get greenlit later, they should get their own phase(s) appended to this
-plan, each still starting with "read `DESIGN.md` first."
-
----
-
-## How to Use This File With the Agent
-
-For each phase, give the agent:
-1. This phase's section from this file, verbatim
-2. A reminder: *"Read DESIGN.md before writing any code. If something in this phase
-   prompt conflicts with DESIGN.md, stop and ask rather than picking one."*
-3. Access to the previous phase's code/tests as context
-
-Do not paste the whole plan into one session — phases are sized to be separate agent
-tasks so context stays focused and reviewable.
+- Running `docker compose up` brings up the entire system (DB, API, Worker, Redis, Frontend).
+- Navigating to `http://localhost:3000` (or designated port) renders the risk map and functional UI components interacting cleanly with the backend API container.
